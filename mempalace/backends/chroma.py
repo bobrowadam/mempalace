@@ -191,7 +191,37 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     return len(head) == 2 and head[0] == 0x80 and tail == b"\x2e"
 
 
-def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
+def _missing_metadata_within_preflush_window(
+    palace_path: str,
+    segment_name: str,
+    collection_name: str,
+) -> bool:
+    """Return True when a missing metadata pickle is expected flush-lag.
+
+    Collections created with mempalace's large ``hnsw:sync_threshold`` can
+    legitimately have binary HNSW payload files before the first metadata
+    pickle is flushed. Only treat that shape as safe when SQLite confirms this
+    is the collection's current vector segment and the row count is still
+    within the configured preflush window.
+    """
+
+    if _vector_segment_id(palace_path, collection_name) != segment_name:
+        return False
+
+    sqlite_count = _sqlite_embedding_count(palace_path, collection_name)
+    if sqlite_count is None:
+        return False
+
+    sync_threshold = _read_sync_threshold(palace_path, collection_name)
+    preflush_floor = max(_HNSW_DIVERGENCE_FALLBACK_FLOOR, 2 * sync_threshold)
+    return sqlite_count <= preflush_floor
+
+
+def quarantine_stale_hnsw(
+    palace_path: str,
+    stale_seconds: float = 300.0,
+    collection_name: str = "mempalace_drawers",
+) -> list[str]:
     """Rename HNSW segment dirs that look unsafe to open.
 
     This catches two classes of HNSW corruption before ChromaDB opens the
@@ -251,16 +281,31 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
 
         # Stage 2: integrity gate. Mtime drift alone is not corruption because
         # Chroma flushes HNSW asynchronously. A healthy metadata file proves the
-        # ordinary stale-by-mtime case is just flush lag.
-        if not payload_corrupt and _segment_appears_healthy(seg_dir):
-            logger.info(
-                "HNSW mtime gap %.0fs on %s exceeds threshold but segment "
-                "metadata and payload size are intact — flush-lag, not "
-                "corruption. Leaving in place.",
-                sqlite_mtime - hnsw_mtime,
-                seg_dir,
-            )
-            continue
+        # ordinary stale-by-mtime case is just flush lag. A missing metadata
+        # file can also be normal before the first sync_threshold flush, but
+        # only when SQLite confirms this is the live vector segment and its row
+        # count is still within the configured preflush window.
+        if not payload_corrupt:
+            if _segment_appears_healthy(seg_dir):
+                logger.info(
+                    "HNSW mtime gap %.0fs on %s exceeds threshold but segment "
+                    "metadata and payload size are intact — flush-lag, not "
+                    "corruption. Leaving in place.",
+                    sqlite_mtime - hnsw_mtime,
+                    seg_dir,
+                )
+                continue
+            if not os.path.isfile(os.path.join(seg_dir, "index_metadata.pickle")) and (
+                _missing_metadata_within_preflush_window(palace_path, name, collection_name)
+            ):
+                logger.info(
+                    "HNSW mtime gap %.0fs on %s exceeds threshold and metadata "
+                    "has not flushed yet, but sqlite count is within the "
+                    "configured preflush window. Leaving in place.",
+                    sqlite_mtime - hnsw_mtime,
+                    seg_dir,
+                )
+                continue
 
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         target = f"{seg_dir}.drift-{stamp}"

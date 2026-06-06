@@ -641,6 +641,61 @@ def _make_palace_with_segment(tmp_path, hnsw_mtime, sqlite_mtime, meta_bytes=_HE
     return palace, seg
 
 
+def _seed_quarantine_sqlite(
+    palace: Path,
+    segment_id: str,
+    sqlite_count: int,
+    sync_threshold: int,
+) -> None:
+    db_path = palace / "chroma.sqlite3"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE collection_metadata (
+                collection_id TEXT,
+                key TEXT NOT NULL,
+                str_value TEXT,
+                int_value INTEGER,
+                float_value REAL,
+                bool_value INTEGER,
+                PRIMARY KEY (collection_id, key)
+            );
+            CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT NOT NULL, scope TEXT NOT NULL);
+            CREATE TABLE embeddings (
+                id INTEGER PRIMARY KEY,
+                segment_id TEXT NOT NULL,
+                embedding_id TEXT NOT NULL,
+                seq_id BLOB NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        collection_id = "col-test"
+        conn.execute(
+            "INSERT INTO collections (id, name) VALUES (?, ?)", (collection_id, "mempalace_drawers")
+        )
+        conn.execute(
+            """INSERT INTO collection_metadata (collection_id, key, int_value)
+               VALUES (?, 'hnsw:sync_threshold', ?)""",
+            (collection_id, sync_threshold),
+        )
+        conn.execute(
+            "INSERT INTO segments (id, collection, scope) VALUES (?, ?, 'VECTOR')",
+            (segment_id, collection_id),
+        )
+        for i in range(sqlite_count):
+            conn.execute(
+                """INSERT INTO embeddings (id, segment_id, embedding_id, seq_id)
+                   VALUES (?, ?, ?, ?)""",
+                (i + 1, segment_id, f"d-{i}", b"\0"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_quarantine_stale_hnsw_renames_corrupt_segment(tmp_path):
     """Segment with stale mtime AND a malformed metadata file gets renamed."""
     now = 1_700_000_000.0
@@ -688,6 +743,32 @@ def test_quarantine_stale_hnsw_leaves_empty_segment_without_metadata_alone(tmp_p
         sqlite_mtime=now,
         meta_bytes=None,
     )
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_stale_hnsw_tolerates_preflush_segment_without_metadata(tmp_path):
+    """Missing metadata can be normal below mempalace's large sync threshold."""
+
+    now = 1_700_000_000.0
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 7200,
+        sqlite_mtime=now,
+        meta_bytes=None,
+    )
+    _seed_quarantine_sqlite(
+        palace,
+        segment_id=seg.name,
+        sqlite_count=9560,
+        sync_threshold=50_000,
+    )
+    (seg / "data_level0.bin").write_bytes(b"\0" * (_HNSW_MISSING_METADATA_DATA_FLOOR + 1))
+    os.utime(seg / "data_level0.bin", (now - 7200, now - 7200))
+    os.utime(palace / "chroma.sqlite3", (now, now))
 
     moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
 
@@ -821,9 +902,9 @@ def test_make_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeyp
     ChromaBackend.make_client(palace_path)
     ChromaBackend.make_client(palace_path)
 
-    assert calls == [
-        palace_path
-    ], "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+    assert calls == [palace_path], (
+        "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+    )
 
 
 def test_make_client_gates_invalid_metadata_on_first_call(tmp_path, monkeypatch):
@@ -939,9 +1020,9 @@ def test_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeypatch)
     finally:
         backend.close()
 
-    assert (
-        calls == [palace_path]
-    ), "quarantine_stale_hnsw should fire once per palace per process from _client(), not on every call"
+    assert calls == [palace_path], (
+        "quarantine_stale_hnsw should fire once per palace per process from _client(), not on every call"
+    )
 
 
 # ── _pin_hnsw_threads (per-process retrofit, separate from this PR's gate) ──
