@@ -53,6 +53,7 @@ def _detect_hall_cached(content: str) -> str:
 CONVO_EXTENSIONS = {
     ".txt",
     ".md",
+    ".org",
     ".json",
     ".jsonl",
 }
